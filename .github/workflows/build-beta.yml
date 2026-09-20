@@ -1,0 +1,158 @@
+name: Build Signal APK (Beta)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'نوع البناء'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+      flavor:
+        description: 'Flavor (websiteProd أخف وأسهل / playProd يحتاج Firebase)'
+        required: true
+        default: 'websiteProd'
+        type: choice
+        options:
+          - websiteProd
+          - playProd
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1) سحب الكود
+      # ─────────────────────────────────────────────
+      - name: سحب الكود
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+          fetch-depth: 1
+
+      # ─────────────────────────────────────────────
+      # 2) إعداد Java 21
+      # ─────────────────────────────────────────────
+      - name: إعداد JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # ─────────────────────────────────────────────
+      # 3) التحقق من Gradle Wrapper
+      # ─────────────────────────────────────────────
+      - name: التحقق من Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      # ─────────────────────────────────────────────
+      # 4) إعداد مساحة تبادل 16GB (Signal يحتاج ذاكرة كبيرة)
+      # ─────────────────────────────────────────────
+      - name: إعداد مساحة تبادل 16GB
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=progress
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "✅ Swap جاهز"
+          free -h
+
+      # ─────────────────────────────────────────────
+      # 5) إعداد Gradle مع Cache
+      # ─────────────────────────────────────────────
+      - name: إعداد Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      # ─────────────────────────────────────────────
+      # 6) تحضير keystore للتوقيع (فقط في release)
+      # ─────────────────────────────────────────────
+      - name: تحضير الـ keystore
+        if: ${{ github.event.inputs.build_type == 'release' }}
+        run: |
+          echo "${{ secrets.SIGNAL_KEYSTORE_BASE64 }}" | base64 -d > "$GITHUB_WORKSPACE/signal.keystore"
+          cat > "$GITHUB_WORKSPACE/keystore.properties" <<EOF
+          storeFile=../signal.keystore
+          storePassword=${{ secrets.SIGNAL_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.SIGNAL_KEY_ALIAS }}
+          keyPassword=${{ secrets.SIGNAL_KEY_PASSWORD }}
+          EOF
+          echo "✅ keystore.properties تم إنشاؤه"
+
+      # ─────────────────────────────────────────────
+      # 7) توليد keystore تلقائي لو ما فيش secrets (debug فقط)
+      # ─────────────────────────────────────────────
+      - name: توليد keystore مؤقت للتجربة
+        if: ${{ github.event.inputs.build_type == 'debug' }}
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$GITHUB_WORKSPACE/debug.keystore" \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US"
+          echo "✅ debug keystore جاهز"
+
+      # ─────────────────────────────────────────────
+      # 8) البناء الفعلي
+      # ─────────────────────────────────────────────
+      - name: بناء APK
+        run: |
+          set -e
+          FLAVOR="${{ github.event.inputs.flavor }}"
+          TYPE="${{ github.event.inputs.build_type }}"
+
+          # تحويل أول حرف لكبير (Bash-compatible)
+          FLAVOR_CAP="$(echo "${FLAVOR}" | sed 's/^\(.\)/\U\1/')"
+          TYPE_CAP="$(echo "${TYPE}"   | sed 's/^\(.\)/\U\1/')"
+
+          TASK="assemble${FLAVOR_CAP}${TYPE_CAP}"
+          echo "🚀 تشغيل المهمة: ${TASK}"
+
+          ./gradlew "${TASK}" \
+            --no-daemon \
+            --max-workers=2 \
+            --stacktrace \
+            --warning-mode=all
+
+      # ─────────────────────────────────────────────
+      # 9) رفع الـ APK
+      # ─────────────────────────────────────────────
+      - name: رفع الـ APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-${{ github.event.inputs.flavor }}-${{ github.event.inputs.build_type }}
+          path: |
+            **/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ─────────────────────────────────────────────
+      # 10) رفع التقارير عند الفشل
+      # ─────────────────────────────────────────────
+      - name: رفع التقارير عند الفشل
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            **/build/reports
+            **/build/outputs/logs
+            **/build/test-results
+          if-no-files-found: ignore
+          retention-days: 7
